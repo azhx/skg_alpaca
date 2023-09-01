@@ -24,6 +24,7 @@ import utils
 from torch.utils.data import Dataset
 from transformers import Trainer
 from tqdm import tqdm
+from bisect import bisect_right
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -55,6 +56,8 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    pkl_path: str = field(default="data_v4_input_ids_labels.pkl", 
+                          metadata={"help": "Path to the pickled version of tokenized data. Loading from this is faster. Must be in same directory as data_path"})
     has_instruction: bool = field(default=True, metadata={"help": "Whether we should use instructions for this dataset."})
     dataset_type: str = field(default="llama", metadata={"help": "Type of dataset. [llama, skg]"})
 
@@ -176,16 +179,25 @@ class SupervisedSKGDataset(Dataset):
         struct_end = struct_start + len(example['struct_in'])
         output_start = pre_truncation.find(example['output'])
 
-        seq_in = tokenizer(pre_truncation, return_tensors="pt")
-        output_start_token = seq_in.char_to_token(output_start)
-        post_struct_token = seq_in.char_to_token(struct_end)
-        start_struct_token = seq_in.char_to_token(struct_start)
+        if "xgen" in str(type(tokenizer)):            # if we are using xgen, we need to manually calculate the offsets
+            seq_in = tokenizer(pre_truncation, return_tensors="pt")
+            _, offsets = tokenizer.decode_with_offsets(seq_in['input_ids'][0])
+            output_start_token = bisect_right(offsets, output_start)
+            post_struct_token = bisect_right(offsets, struct_end)
+            start_struct_token = bisect_right(offsets, struct_start)
+        else:    
+            seq_in = tokenizer(pre_truncation, return_tensors="pt")
+            output_start_token = seq_in.char_to_token(output_start)
+            post_struct_token = seq_in.char_to_token(struct_end)
+            start_struct_token = seq_in.char_to_token(struct_start)
+            assert seq_in.input_ids[:, -1] == 2 # eos token
 
         diff = max(seq_in.input_ids.shape[1] - tokenizer.model_max_length, 0)
         
-        if post_struct_token - start_struct_token <= diff and len(example['struct_in']) > 0:
+        if (post_struct_token - start_struct_token <= diff and diff > 0):
             # if there is a struct and this is the case, we would have completely truncated the struct! 
             # If this is the case, we should just completely throw away the example
+            # or, there is no struct, but the output is too long, so we should throw away the example
             return None
         
         struct_end_token = post_struct_token - diff
@@ -194,21 +206,21 @@ class SupervisedSKGDataset(Dataset):
         # truncating the struct by an offset of diff means the output will be shifted diff tokens earlier
         labels[:output_start_token - diff] = IGNORE_INDEX
 
-        try:
-            assert len(input_ids) == len(labels) <= tokenizer.model_max_length
-        except:
-            import pdb; pdb.set_trace()
+        
+        assert len(input_ids) == len(labels) <= tokenizer.model_max_length
 
         return dict(input_ids = input_ids, labels = labels)
 
-    def __init__(self, data_path: str, has_instruction: bool, tokenizer: transformers.PreTrainedTokenizer):
+    def __init__(self, data_path: str, has_instruction: bool, tokenizer: transformers.PreTrainedTokenizer, pkl_path: str):
         super(SupervisedSKGDataset, self).__init__()
         logging.warning("Loading data...")
 
+        data_path_dir = os.path.dirname(data_path)
+        full_pkl_path = os.path.join(data_path_dir, pkl_path)
         # if there is already a tokenized data file, then just load that
-        if os.path.exists("data_v4_input_ids_labels.pkl"):
+        if os.path.exists(full_pkl_path):
             logging.warning("Found tokenized data file, loading...")
-            with open("data_v4_input_ids_labels.pkl", "rb") as f:
+            with open(full_pkl_path, "rb") as f:
                 save = pickle.load(f)
             self.input_ids = save["input_ids"]
             self.labels = save["labels"]
@@ -242,18 +254,17 @@ class SupervisedSKGDataset(Dataset):
             self.final_data_identifiers.append(example['id'])
         # dump input_ids and labels into a huge pickle file
         save = {"input_ids": self.input_ids, "labels": self.labels}
-        with open("data_v4_input_ids_labels.pkl", "wb") as f:
+        with open(full_pkl_path, "wb") as f:
             pickle.dump(save, f)
 
         # print the final dataset size
         logging.warning(f"Final dataset size: {len(self.input_ids)}")
 
-        import pdb; pdb.set_trace()
-
     def __len__(self):
         return len(self.input_ids)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        #print("sizes", self.input_ids[i].shape, self.labels[i].shape)
         return dict(input_ids=self.input_ids[i], labels=self.labels[i])
 
 @dataclass
@@ -281,7 +292,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
         train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, has_instruction=data_args.has_instruction)
     else:
         # dataset_type = "skg"
-        train_dataset = SupervisedSKGDataset(tokenizer=tokenizer, data_path=data_args.data_path, has_instruction=data_args.has_instruction)
+        train_dataset = SupervisedSKGDataset(tokenizer=tokenizer, data_path=data_args.data_path, has_instruction=data_args.has_instruction, pkl_path=data_args.pkl_path)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
@@ -290,29 +301,52 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
-        padding_side="right",
-        use_fast=True,
-    )
+
+    print("loading tokenizer")
     special_tokens_dict = dict()
-    if tokenizer.pad_token is None:
-        special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
-    if tokenizer.eos_token is None:
-        special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
-    if tokenizer.bos_token is None:
-        special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
-    if tokenizer.unk_token is None:
-        special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
+    if "xgen" in model_args.model_name_or_path:
+        print("loading xgen")
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=True,
+            add_eos_token=True,
+            trust_remote_code=True,
+            pad_token="<|endoftext|>",
+        )
+        tokenizer.pad_token = tokenizer.eos_token        
+    else:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=True,
+            add_eos_token=True,
+            trust_remote_code=True
+        )
+        if tokenizer.pad_token is None:
+            special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
+        if tokenizer.eos_token is None:
+            special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
+        if tokenizer.bos_token is None:
+            special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
+        if tokenizer.unk_token is None:
+            special_tokens_dict["unk`_token"] = DEFAULT_UNK_TOKEN
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+
+    print("done loading dataset")
 
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
+        trust_remote_code=True,
     )
+
+    print("done loading model")
 
     smart_tokenizer_and_embedding_resize(
         special_tokens_dict=special_tokens_dict,
